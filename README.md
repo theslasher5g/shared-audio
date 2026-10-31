@@ -93,6 +93,20 @@ und nicht doppelt oder gar nicht:
 6. App-Lautstärke: Die Lautstärke einer Anwendung im Windows-Mixer wirkt noch vor dem Loopback, die
    *Ziel-Lautstärke* in shared-audio gilt je Kopfhörer.
 
+## Bluetooth-Verzögerung verringern
+
+Die GUI zeigt je Ziel „Programm ≈ X ms“, die **gemessene** Latenz von shared-audio. Ist dieser Wert klein
+(< 30 ms) und klingt es trotzdem stark verzögert, liegt die Verzögerung in der Bluetooth-Strecke (Codec,
+Funkpuffer, Kopfhörer). Das lässt sich nur dort verbessern:
+
+- **Spielemodus / Low-Latency-Modus** des Kopfhörers in dessen App einschalten (viele Earbuds haben das).
+- **Bluetooth LE Audio** (Windows 11 24H2+, LE-Audio-fähige Kopfhörer und Adapter) hat deutlich weniger Latenz als
+  klassisches A2DP.
+- Ein **Bluetooth-Sender mit aptX Low Latency/Adaptive** (USB-Dongle oder 3,5-mm-Sender) statt des eingebauten
+  Adapters nutzen; diese erscheinen in Windows als normales Ausgabegerät.
+- **Videos:** Player gleichen Bild und Ton auf das Quellgerät ab, nicht auf die Kopfhörer. In VLC/MPC-HC lässt sich
+  der Ton um die Bluetooth-Latenz vorziehen (Audio-Synchronisation, z. B. −200 ms).
+
 ## Technik in Kürze
 
 Siehe [`CLAUDE.md`](CLAUDE.md) für Details.

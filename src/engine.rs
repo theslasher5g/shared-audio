@@ -36,7 +36,7 @@ const RING_RESERVE_MS: (u32, u32, u32) = (4, 3, 80);
 /// Reserve im Gerätepuffer über eine WASAPI-Periode hinaus: Start, Schritt, Maximum.
 const DEVICE_RESERVE_MS: (u32, u32, u32) = (4, 3, 40);
 /// Liegt der Füllstand so viel über dem Soll (mind. 2 Capture-Perioden), wird verworfen.
-const DISCARD_EXCESS_MS: usize = 30;
+const DISCARD_EXCESS_MS: usize = 20;
 /// Verarbeitungs-Chunk des Renderers (klein = geringe Latenz).
 const CHUNK_MS: u32 = 2;
 /// Nach einem Ring-Unterlauf so lange warten, ob die Quelle nur verstummt ist.
@@ -603,6 +603,7 @@ fn render_session(ctx: &RenderCtx) -> Result<End> {
         dst_rate,
         src_rate,
         pending_underrun: None,
+        latency_avg: 0.0,
     };
     st.update_targets();
 
@@ -667,6 +668,8 @@ struct RenderState {
     src_rate: u32,
     /// Ring-Unterlauf, der noch geprüft wird: (Zeitpunkt, Paketzähler der Quelle).
     pending_underrun: Option<(Instant, u64)>,
+    /// Gemessene Latenz (Ring + Gerätepuffer), geglättet, in ms.
+    latency_avg: f64,
 }
 
 impl RenderState {
@@ -712,7 +715,6 @@ fn render_loop(
         st.delay
             .set_delay_frames(ms_to_frames(params.delay_ms(), st.dst_rate));
         let target_gain = params.effective_gain();
-        params.set_latency_ms(st.latency_ms());
 
         // Ring-Unterlauf auswerten: kamen danach weiter Pakete, war es ein echter Aussetzer
         // (Reserve erhöhen). Kam nichts mehr, ist die Quelle nur verstummt (nichts tun).
@@ -780,6 +782,18 @@ fn render_loop(
             }
             render.write_to_device(st.chunk, &st.bytes, None)?;
             space -= st.chunk;
+        }
+        if started {
+            // Tatsächliche Latenz messen: was im Ring wartet + was im Gerätepuffer liegt.
+            let queued_dev = st.max_padding.saturating_sub(space).max(padding);
+            let now_ms = frames_available(cons) as f64 * 1000.0 / st.src_rate as f64
+                + queued_dev as f64 * 1000.0 / st.dst_rate as f64;
+            st.latency_avg = if st.latency_avg == 0.0 {
+                now_ms
+            } else {
+                st.latency_avg + 0.02 * (now_ms - st.latency_avg)
+            };
+            params.set_latency_ms(st.latency_avg.round().max(1.0) as u32);
         }
 
         // Das Event kommt einmal pro Periode. Solange gepuffert wird, öfter nachsehen.

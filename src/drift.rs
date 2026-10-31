@@ -21,8 +21,8 @@ impl DriftController {
             target_frames: target_frames as f64,
             smoothed: target_frames as f64,
             alpha: 0.02,
-            // 50 ms Abweichung → 0,25 % Anpassung
-            gain_per_second: 0.05,
+            // 20 ms Abweichung → 0,2 % Anpassung (überschüssiger Puffer baut sich in Sekunden ab)
+            gain_per_second: 0.1,
             rate: rate as f64,
             initialized: false,
         }
