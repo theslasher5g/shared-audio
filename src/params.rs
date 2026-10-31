@@ -132,6 +132,14 @@ pub fn peak_stereo(data: &[f32]) -> (f32, f32) {
     (l, r)
 }
 
+/// Linearer Spitzenwert → Anzeigewert 0..1 (−60 dB … 0 dB).
+pub fn level_to_meter(peak: f32) -> f32 {
+    if peak <= 0.000_001 {
+        return 0.0;
+    }
+    ((20.0 * peak.log10() + 60.0) / 60.0).clamp(0.0, 1.0)
+}
+
 /// Gain mit linearer Rampe über einen Block (verhindert Knackser bei Änderungen).
 pub struct GainRamp {
     current: f32,
@@ -212,6 +220,14 @@ mod tests {
     #[test]
     fn peak_stereo_works() {
         assert_eq!(peak_stereo(&[0.1, -0.7, -0.3, 0.2]), (0.3, 0.7));
+    }
+
+    #[test]
+    fn meter_scale() {
+        assert_eq!(level_to_meter(0.0), 0.0);
+        assert!((level_to_meter(1.0) - 1.0).abs() < 1e-6);
+        assert!((level_to_meter(0.1) - 40.0 / 60.0).abs() < 1e-4);
+        assert_eq!(level_to_meter(0.0001), 0.0);
     }
 
     #[test]
