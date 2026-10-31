@@ -1954,6 +1954,7 @@ dependencies = [
  "serde",
  "serde_json",
  "wasapi",
+ "windows",
 ]
 
 [[package]]

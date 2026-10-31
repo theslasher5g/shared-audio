@@ -49,8 +49,10 @@ Loopback ─▶ Capture-Thread ─▶ to_stereo ─▶ SPSC-Ring pro Ziel ─▶
   liest das Mix-Format, mischt auf Stereo, schreibt in alle Sinks. Bei Stille liefert Loopback keine Pakete →
   bei Event-Timeout (20 ms) werden Nullen nachgefüllt. Hält die Sink-Liste; Add/Remove/SetSource kommen per `mpsc`.
 - **Render-Thread** (1× je Ziel): eigene Reconnect-Schleife (Fehler → `Unavailable`, alle 1 s neu versuchen).
-  Pro 10-ms-Chunk: Füllstand → Drift-Regler → Resampler → Delay → Gain-Rampe → Peak → WASAPI.
-  Bei Unterlauf wird bis zum Soll-Füllstand (40 ms) neu gepuffert, bei > 4× Soll werden die ältesten Samples verworfen.
+  Pro 2-ms-Chunk: Füllstand → Drift-Regler → Resampler → Delay → Gain-Rampe → Peak → WASAPI.
+  Niedrige Latenz: Gerätepuffer nur bis 1 Periode + 2 Chunks füllen; Ring-Soll = 1 Chunk + Jitter-Reserve
+  (`drift::JitterReserve`, Start 6 ms, +4 ms bei ≥ 3 Aussetzern in 5 s, max. 60 ms). Bei Unterlauf wird neu
+  gepuffert, bei > Soll + 25 ms werden die ältesten Samples verworfen. Audio-Threads laufen mit MMCSS „Pro Audio“.
 - **Kein Lock/keine Allokation** in den Audio-Schleifen; Parameter und Pegel sind Atomics (`params.rs`).
   Pegel: `fetch_max` auf die f32-Bits (nicht-negative Floats sind monoton), GUI liest mit `swap(0)`.
 - **Rückkopplung:** `Engine::add_target`/`set_source` lehnen dasselbe Gerät ab; Render-Threads vergleichen

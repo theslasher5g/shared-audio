@@ -22,7 +22,7 @@ impl StereoResampler {
     pub fn new(in_rate: u32, out_rate: u32, out_chunk: usize) -> Result<Self> {
         let ratio = out_rate as f64 / in_rate as f64;
         let params = SincInterpolationParameters {
-            sinc_len: 128,
+            sinc_len: 64,
             f_cutoff: None,
             oversampling_factor: 128,
             interpolation: SincInterpolationType::Cubic,

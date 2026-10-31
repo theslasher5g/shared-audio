@@ -100,6 +100,8 @@ Siehe [`CLAUDE.md`](CLAUDE.md) für Details.
 - Ein Capture-Thread liest das Loopback, mischt auf Stereo (Mono/5.1/7.1 …) und schreibt in einen lock-freien
   SPSC-Ringpuffer (`ringbuf`) pro Ziel.
 - Je Ziel ein Render-Thread: Drift-Regler → Resampling (`rubato`, Sinc) → Delay-Line → Gain/Mute → WASAPI.
+  Verarbeitung in 2-ms-Blöcken; der Gerätepuffer wird nur bis eine Periode + 2 Blöcke gefüllt, die Audio-Threads
+  laufen mit MMCSS-Priorität „Pro Audio“.
   Im Audiopfad gibt es keine Locks und keine Allokationen; Parameter und Pegel laufen über Atomics.
 - **Drift-Ausgleich:** Ein P-Regler stellt das Resampling-Verhältnis (max. ±0,5 %) anhand des Ringfüllstands
   nach, sodass Geräte mit leicht abweichender Taktrate den Puffer nicht leeren oder überfüllen. Läuft der Puffer
@@ -112,10 +114,12 @@ Siehe [`CLAUDE.md`](CLAUDE.md) für Details.
 
 - **Nicht auf Hardware getestet** (siehe oben); die Reaktion auf echte Bluetooth-Trennungen ist
   nur über Fehlercodes des Treibers abgesichert.
-- **Gesamtlatenz:** Die Verteilung selbst fügt ca. 60–100 ms hinzu (Puffer 40 ms + Geräte-Puffer 50 ms +
-  Resampler). Für Musik/Video mit Delay-Abgleich unkritisch, für Echtzeit-Spiele oder Instrumente nicht geeignet.
-  Das Delay gleicht nur die *Unterschiede* zwischen den Zielen aus – ein Ziel kann nicht „früher“ als ein
-  anderes gemacht werden, außer man verzögert das andere.
+- **Latenz:** Die Verteilung selbst fügt typischerweise nur **ca. 15–25 ms** hinzu (eine WASAPI-Periode von
+  meist 10 ms + 2-ms-Blöcke + kleine Jitter-Reserve). Die GUI zeigt den aktuellen Wert je Ziel an („≈ … ms“).
+  Treten wiederholt Aussetzer auf, vergrößert das Programm die Reserve selbstständig in 4-ms-Schritten
+  (max. 60 ms). **Nicht** entfernbar ist die Latenz der Bluetooth-Übertragung selbst (Codec + Kopfhörer,
+  meist 100–250 ms) – die entsteht im Gerät bzw. im Windows-Bluetooth-Stack. Das Delay pro Ziel gleicht
+  nur die *Unterschiede* zwischen den Zielen aus; für den Gleichlauf das *schnellere* Gerät verzögern.
 - **Delay-Änderungen** springen hörbar (kurzes Knacken), da die Verzögerung hart umgeschaltet wird.
 - **Kopiergeschützte Inhalte** (DRM) liefern im Loopback ggf. Stille.
 - Der Shared Mode wird verwendet; Anwendungen im exklusiven Modus erscheinen nicht im Loopback.

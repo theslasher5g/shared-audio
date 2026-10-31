@@ -45,6 +45,11 @@ impl DriftController {
     pub fn reset(&mut self) {
         self.initialized = false;
     }
+
+    /// Soll-Füllstand ändern (z. B. wenn die Jitter-Reserve wächst).
+    pub fn set_target(&mut self, target_frames: usize) {
+        self.target_frames = target_frames as f64;
+    }
 }
 
 #[cfg(test)]
@@ -100,5 +105,88 @@ mod tests {
             }
         }
         assert!(max_dev < 500.0, "Füllstand driftet weg: {max_dev}");
+    }
+}
+
+/// Adaptive Sicherheitsreserve des Jitter-Puffers: startet klein (geringe Latenz) und wächst nur,
+/// wenn wiederholt Aussetzer auftreten. Einzelne Aussetzer (z. B. beim Übergang in Stille) bleiben
+/// folgenlos.
+pub struct JitterReserve {
+    reserve_ms: u32,
+    max_ms: u32,
+    step_ms: u32,
+    threshold: u32,
+    window: std::time::Duration,
+    count: u32,
+    window_start: Option<std::time::Instant>,
+}
+
+impl JitterReserve {
+    pub fn new(start_ms: u32, max_ms: u32) -> Self {
+        Self {
+            reserve_ms: start_ms,
+            max_ms,
+            step_ms: 4,
+            threshold: 3,
+            window: std::time::Duration::from_secs(5),
+            count: 0,
+            window_start: None,
+        }
+    }
+
+    pub fn reserve_ms(&self) -> u32 {
+        self.reserve_ms
+    }
+
+    /// Aussetzer melden. Gibt `true` zurück, wenn die Reserve vergrößert wurde.
+    pub fn underrun(&mut self, now: std::time::Instant) -> bool {
+        match self.window_start {
+            Some(start) if now.duration_since(start) <= self.window => self.count += 1,
+            _ => {
+                self.window_start = Some(now);
+                self.count = 1;
+            }
+        }
+        if self.count >= self.threshold && self.reserve_ms < self.max_ms {
+            self.reserve_ms = (self.reserve_ms + self.step_ms).min(self.max_ms);
+            self.count = 0;
+            self.window_start = None;
+            return true;
+        }
+        false
+    }
+}
+
+#[cfg(test)]
+mod jitter_tests {
+    use super::JitterReserve;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn single_underruns_do_not_grow() {
+        let mut j = JitterReserve::new(6, 60);
+        let t = Instant::now();
+        assert!(!j.underrun(t));
+        assert!(!j.underrun(t + Duration::from_secs(10)));
+        assert!(!j.underrun(t + Duration::from_secs(20)));
+        assert_eq!(j.reserve_ms(), 6);
+    }
+
+    #[test]
+    fn repeated_underruns_grow_up_to_max() {
+        let mut j = JitterReserve::new(6, 12);
+        let t = Instant::now();
+        j.underrun(t);
+        j.underrun(t + Duration::from_millis(100));
+        assert!(j.underrun(t + Duration::from_millis(200)));
+        assert_eq!(j.reserve_ms(), 10);
+        for k in 0..3 {
+            j.underrun(t + Duration::from_millis(300 + k));
+        }
+        assert_eq!(j.reserve_ms(), 12);
+        for k in 0..3 {
+            j.underrun(t + Duration::from_millis(400 + k));
+        }
+        assert_eq!(j.reserve_ms(), 12);
     }
 }

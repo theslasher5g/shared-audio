@@ -25,6 +25,7 @@ dirs = "7"
 
 [target.'cfg(windows)'.dependencies]
 wasapi = "0.26"
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Threading"] }
 ctrlc = "3"
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts"] }
 

@@ -51,6 +51,7 @@ pub struct TargetParams {
     peak_l: AtomicU32,
     peak_r: AtomicU32,
     status: AtomicU8,
+    latency_ms: AtomicU32,
     pub underruns: AtomicU64,
     pub overruns: AtomicU64,
     pub dropped_frames: AtomicU64,
@@ -65,6 +66,7 @@ impl TargetParams {
             peak_l: AtomicU32::new(0),
             peak_r: AtomicU32::new(0),
             status: AtomicU8::new(TargetStatus::Stopped as u8),
+            latency_ms: AtomicU32::new(0),
             underruns: AtomicU64::new(0),
             overruns: AtomicU64::new(0),
             dropped_frames: AtomicU64::new(0),
@@ -95,6 +97,14 @@ impl TargetParams {
     }
     pub fn set_status(&self, s: TargetStatus) {
         self.status.store(s as u8, Relaxed);
+    }
+
+    /// Geschätzte Latenz der Verteilung (ohne einstellbares Delay und ohne Bluetooth), 0 = unbekannt.
+    pub fn latency_ms(&self) -> u32 {
+        self.latency_ms.load(Relaxed)
+    }
+    pub fn set_latency_ms(&self, ms: u32) {
+        self.latency_ms.store(ms, Relaxed);
     }
 
     /// Gewünschte Verstärkung (0 bei Mute).

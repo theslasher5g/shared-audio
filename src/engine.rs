@@ -14,7 +14,7 @@
 use crate::channels::to_stereo;
 use crate::delay::{ms_to_frames, DelayLine};
 use crate::devices::{self, id_hash};
-use crate::drift::DriftController;
+use crate::drift::{DriftController, JitterReserve};
 use crate::params::{peak_stereo, GainRamp, TargetParams, TargetStatus};
 use crate::resample::StereoResampler;
 use crate::ring::{discard_frames, frames_available, pop_frames_exact, push_frames, stereo_ring};
@@ -31,14 +31,16 @@ use wasapi::{
 
 /// Größe des Ringpuffers pro Ziel.
 const RING_MS: usize = 500;
-/// Soll-Füllstand des Rings (Puffer gegen Jitter; Basis für den Drift-Regler).
-const TARGET_FILL_MS: usize = 40;
-/// Bei mehr als Vielfachem des Soll-Füllstands werden die ältesten Samples verworfen.
-const DISCARD_FACTOR: usize = 4;
-/// Verarbeitungs-Chunk des Renderers.
-const CHUNK_MS: u32 = 10;
-/// WASAPI-Pufferlänge der Ausgabe (100 ns).
-const DEVICE_BUFFER_HNS: i64 = 500_000;
+/// Start-Sicherheitsreserve des Rings über einen Chunk hinaus (wächst bei wiederholten Aussetzern).
+const RESERVE_START_MS: u32 = 6;
+/// Obergrenze der Sicherheitsreserve.
+const RESERVE_MAX_MS: u32 = 60;
+/// Liegt der Füllstand so viel über dem Soll, werden die ältesten Samples verworfen.
+const DISCARD_EXCESS_MS: usize = 25;
+/// Verarbeitungs-Chunk des Renderers (klein = geringe Latenz).
+const CHUNK_MS: u32 = 2;
+/// Zusätzliche Chunks im Gerätepuffer über eine WASAPI-Periode hinaus.
+const DEVICE_EXTRA_CHUNKS: usize = 2;
 /// Wartezeit nach einem Fehler, bevor neu verbunden wird.
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 
@@ -367,6 +369,7 @@ fn capture_session(
 
     log::info!("Quelle \"{name}\": {rate} Hz, {ch} Kanäle");
     source.set_open(&dev_id, &name, rate);
+    let _mmcss = mmcss::ProAudio::enter();
     client.start_stream()?;
 
     let mut last_emit = Instant::now();
@@ -376,7 +379,7 @@ fn capture_session(
             if stop.load(Relaxed) || drain_cmds(rx, sinks, source_id) {
                 return Ok(());
             }
-            match event.wait_for_event(20) {
+            match event.wait_for_event(5) {
                 Ok(()) => {
                     while let Some(n) = cap.get_next_packet_size()? {
                         if n == 0 {
@@ -502,41 +505,54 @@ fn render_session(ctx: &RenderCtx) -> Result<End> {
         &Direction::Render,
         &StreamMode::EventsShared {
             autoconvert: true,
-            buffer_duration_hns: DEVICE_BUFFER_HNS.max(period),
+            buffer_duration_hns: 2 * period,
         },
     )?;
     let event = client.set_get_eventhandle()?;
     let render = client.get_audiorenderclient()?;
 
     let chunk = (dst_rate * CHUNK_MS / 1000) as usize;
+    let period_frames = (period as u64 * dst_rate as u64 / 10_000_000) as usize;
+    let buffer_frames = client.get_buffer_size()? as usize;
+    // Gerätepuffer nur so weit füllen wie nötig: eine Engine-Periode plus kleine Reserve.
+    let max_padding = (period_frames + DEVICE_EXTRA_CHUNKS * chunk).min(buffer_frames);
     let mut resampler = StereoResampler::new(src_rate, dst_rate, chunk)?;
+    let src_chunk = (src_rate * CHUNK_MS / 1000) as usize;
     let mut st = RenderState {
         in_buf: vec![0f32; resampler.input_frames_max() * 2 + 64],
         out_buf: vec![0f32; chunk * 2],
         bytes: vec![0u8; chunk * 8],
         delay: DelayLine::for_rate(dst_rate),
         gain: GainRamp::new(ctx.params.effective_gain()),
-        drift: DriftController::new(src_rate as usize * TARGET_FILL_MS / 1000, src_rate),
-        target_fill: src_rate as usize * TARGET_FILL_MS / 1000,
+        drift: DriftController::new(src_chunk, src_rate),
+        jitter: JitterReserve::new(RESERVE_START_MS, RESERVE_MAX_MS),
+        target_fill: 0,
+        src_chunk,
         chunk,
+        max_padding,
+        period_ms: ((period / 10_000) as u32).max(1),
         dst_rate,
         src_rate,
     };
+    st.update_target();
 
-    // Ring registrieren (nach Aufbau aller Puffer), Ausgabepuffer mit Stille füllen.
+    // Ring registrieren (nach Aufbau aller Puffer), Gerät mit minimaler Stille vorfüllen.
     let (prod, mut cons) = stereo_ring(src_rate as usize * RING_MS / 1000);
-    let space = client.get_available_space_in_frames()? as usize;
-    render.write_to_device(space, &vec![0u8; space * 8], Some(BufferFlags::new(2)))?;
+    let prime = max_padding.min(client.get_available_space_in_frames()? as usize);
+    render.write_to_device(prime, &vec![0u8; prime * 8], Some(BufferFlags::new(2)))?;
     let _ = ctx.cmd_tx.send(Cmd::AddSink(Sink {
         id: ctx.id,
         prod,
         params: ctx.params.clone(),
     }));
+    let _mmcss = mmcss::ProAudio::enter();
     client.start_stream()?;
     ctx.params.set_status(TargetStatus::Active);
     log::info!(
-        "Ziel \"{}\": {dst_rate} Hz (Quelle {src_rate} Hz)",
-        ctx.name
+        "Ziel \"{}\": {dst_rate} Hz (Quelle {src_rate} Hz), Periode {:.1} ms, Gerätepuffer max. {:.1} ms",
+        ctx.name,
+        period as f64 / 10_000.0,
+        max_padding as f64 * 1000.0 / dst_rate as f64
     );
 
     let result = render_loop(
@@ -550,6 +566,7 @@ fn render_session(ctx: &RenderCtx) -> Result<End> {
     );
     let _ = client.stop_stream();
     let _ = ctx.cmd_tx.send(Cmd::RemoveSink(ctx.id));
+    ctx.params.set_latency_ms(0);
     result
 }
 
@@ -560,10 +577,41 @@ struct RenderState {
     delay: DelayLine,
     gain: GainRamp,
     drift: DriftController,
+    jitter: JitterReserve,
+    /// Soll-Füllstand des Rings in Quell-Frames (Chunk + Reserve).
     target_fill: usize,
+    src_chunk: usize,
     chunk: usize,
+    max_padding: usize,
+    period_ms: u32,
     dst_rate: u32,
     src_rate: u32,
+}
+
+impl RenderState {
+    fn update_target(&mut self) {
+        let reserve = self.src_rate as usize * self.jitter.reserve_ms() as usize / 1000;
+        self.target_fill = self.src_chunk + reserve;
+        self.drift.set_target(self.target_fill);
+    }
+
+    /// Geschätzte Latenz der Kette in ms (Ring + Gerätepuffer, ohne einstellbares Delay).
+    fn latency_ms(&self) -> u32 {
+        let ring = self.target_fill as f64 * 1000.0 / self.src_rate as f64;
+        let dev = self.max_padding as f64 * 1000.0 / self.dst_rate as f64;
+        (ring + dev).round() as u32
+    }
+
+    fn underrun(&mut self, params: &TargetParams) {
+        params.underruns.fetch_add(1, Relaxed);
+        if self.jitter.underrun(Instant::now()) {
+            self.update_target();
+            log::info!(
+                "Aussetzer gehäuft – Puffer auf {} ms erhöht",
+                self.jitter.reserve_ms()
+            );
+        }
+    }
 }
 
 fn render_loop(
@@ -578,6 +626,7 @@ fn render_loop(
     let dev_hash = id_hash(&ctx.device_id);
     let params = &ctx.params;
     let mut started = false;
+    let src_rate = st.src_rate as usize;
     loop {
         if ctx.stop.load(Relaxed) {
             return Ok(End::Stop);
@@ -589,10 +638,16 @@ fn render_loop(
         st.delay
             .set_delay_frames(ms_to_frames(params.delay_ms(), st.dst_rate));
         let target_gain = params.effective_gain();
+        params.set_latency_ms(st.latency_ms());
 
-        let mut space = client.get_available_space_in_frames()? as usize;
+        let padding = client.get_current_padding()? as usize;
+        if started && padding == 0 {
+            // Gerätepuffer ist leergelaufen (Thread zu spät geweckt).
+            st.underrun(params);
+        }
+        let mut space = st.max_padding.saturating_sub(padding);
         while space >= st.chunk {
-            let fill = frames_available(cons);
+            let mut fill = frames_available(cons);
             if !started {
                 if fill < st.target_fill {
                     break; // erst bis zum Soll-Füllstand puffern
@@ -600,8 +655,8 @@ fn render_loop(
                 started = true;
                 st.drift.reset();
             }
-            let mut fill = fill;
-            if fill > st.target_fill * DISCARD_FACTOR {
+            let discard_at = st.target_fill + src_rate * DISCARD_EXCESS_MS / 1000;
+            if fill > discard_at {
                 // Puffer läuft über (z. B. nach Scheduling-Pause) → älteste Samples verwerfen.
                 let d = discard_frames(cons, fill - st.target_fill);
                 params.dropped_frames.fetch_add(d as u64, Relaxed);
@@ -611,9 +666,7 @@ fn render_loop(
             resampler.set_relative_ratio(st.drift.update(fill));
             let need = resampler.input_frames_next();
             if !pop_frames_exact(cons, &mut st.in_buf[..need * 2]) {
-                if client.get_current_padding()? == 0 {
-                    params.underruns.fetch_add(1, Relaxed);
-                }
+                st.underrun(params);
                 started = false; // neu puffern
                 break;
             }
@@ -629,9 +682,43 @@ fn render_loop(
             space -= st.chunk;
         }
 
-        if event.wait_for_event(50).is_err() {
+        // Kurz warten: das Event kommt einmal pro Periode; ohne Daten im Ring nach 1 ms erneut prüfen.
+        let timeout = if started { st.period_ms * 2 } else { 1 };
+        if event.wait_for_event(timeout).is_err() {
             // Timeout: prüft zugleich, ob das Gerät noch lebt (Fehler bei Trennung).
             client.get_current_padding()?;
+        }
+    }
+}
+
+/// MMCSS-Priorität „Pro Audio“ für den aktuellen Thread (pünktliches Aufwachen bei kleinen Puffern).
+mod mmcss {
+    use windows::core::w;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Threading::{
+        AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW,
+    };
+
+    pub struct ProAudio(Option<HANDLE>);
+
+    impl ProAudio {
+        pub fn enter() -> Self {
+            let mut index = 0u32;
+            match unsafe { AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut index) } {
+                Ok(h) => Self(Some(h)),
+                Err(e) => {
+                    log::debug!("MMCSS nicht verfügbar: {e}");
+                    Self(None)
+                }
+            }
+        }
+    }
+
+    impl Drop for ProAudio {
+        fn drop(&mut self) {
+            if let Some(h) = self.0.take() {
+                let _ = unsafe { AvRevertMmThreadCharacteristics(h) };
+            }
         }
     }
 }
