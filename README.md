@@ -114,12 +114,14 @@ Siehe [`CLAUDE.md`](CLAUDE.md) für Details.
 
 - **Nicht auf Hardware getestet** (siehe oben); die Reaktion auf echte Bluetooth-Trennungen ist
   nur über Fehlercodes des Treibers abgesichert.
-- **Latenz:** Die Verteilung selbst fügt typischerweise nur **ca. 15–25 ms** hinzu (eine WASAPI-Periode von
-  meist 10 ms + 2-ms-Blöcke + kleine Jitter-Reserve). Die GUI zeigt den aktuellen Wert je Ziel an („≈ … ms“).
-  Treten wiederholt Aussetzer auf, vergrößert das Programm die Reserve selbstständig in 4-ms-Schritten
-  (max. 60 ms). **Nicht** entfernbar ist die Latenz der Bluetooth-Übertragung selbst (Codec + Kopfhörer,
-  meist 100–250 ms) – die entsteht im Gerät bzw. im Windows-Bluetooth-Stack. Das Delay pro Ziel gleicht
-  nur die *Unterschiede* zwischen den Zielen aus; für den Gleichlauf das *schnellere* Gerät verzögern.
+- **Latenz:** Die Verteilung selbst fügt je nach Treiber **ca. 8–15 ms** (Low-Latency-Modus) bzw.
+  **ca. 20–25 ms** (Standard-Periode 10 ms) hinzu. Unterstützt ein Gerät kleinere Engine-Perioden
+  (`IAudioClient3`, z. B. 2,67 ms), nutzt das Programm sie automatisch für Quelle und Ziele; viele
+  Bluetooth-Treiber unterstützen das allerdings nicht. Die GUI zeigt den aktuellen Wert je Ziel an („≈ … ms“).
+  Bei echten Aussetzern vergrößert das Programm die Puffer selbstständig in 3-ms-Schritten (das Verstummen
+  der Quelle zählt nicht als Aussetzer). **Nicht** entfernbar ist die Latenz der Bluetooth-Übertragung selbst
+  (Codec + Kopfhörer, meist 100–250 ms). Das Delay pro Ziel gleicht nur die *Unterschiede* zwischen den
+  Zielen aus; für den Gleichlauf das *schnellere* Gerät verzögern.
 - **Delay-Änderungen** springen hörbar (kurzes Knacken), da die Verzögerung hart umgeschaltet wird.
 - **Kopiergeschützte Inhalte** (DRM) liefern im Loopback ggf. Stille.
 - Der Shared Mode wird verwendet; Anwendungen im exklusiven Modus erscheinen nicht im Loopback.

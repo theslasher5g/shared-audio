@@ -108,9 +108,8 @@ mod tests {
     }
 }
 
-/// Adaptive Sicherheitsreserve des Jitter-Puffers: startet klein (geringe Latenz) und wächst nur,
-/// wenn wiederholt Aussetzer auftreten. Einzelne Aussetzer (z. B. beim Übergang in Stille) bleiben
-/// folgenlos.
+/// Adaptive Sicherheitsreserve des Jitter-Puffers: startet klein (geringe Latenz) und wächst,
+/// wenn Aussetzer auftreten. Der Aufrufer meldet nur echte Aussetzer (nicht das Verstummen der Quelle).
 pub struct JitterReserve {
     reserve_ms: u32,
     max_ms: u32,
@@ -122,12 +121,18 @@ pub struct JitterReserve {
 }
 
 impl JitterReserve {
-    pub fn new(start_ms: u32, max_ms: u32) -> Self {
+    /// Wächst bei jedem gemeldeten (echten) Aussetzer um `step_ms`, höchstens bis `max_ms`.
+    pub fn new(start_ms: u32, step_ms: u32, max_ms: u32) -> Self {
+        Self::with_threshold(start_ms, step_ms, max_ms, 1)
+    }
+
+    /// Wächst erst, wenn `threshold` Aussetzer innerhalb von 5 s gemeldet werden.
+    pub fn with_threshold(start_ms: u32, step_ms: u32, max_ms: u32, threshold: u32) -> Self {
         Self {
             reserve_ms: start_ms,
             max_ms,
-            step_ms: 4,
-            threshold: 3,
+            step_ms,
+            threshold: threshold.max(1),
             window: std::time::Duration::from_secs(5),
             count: 0,
             window_start: None,
@@ -163,8 +168,8 @@ mod jitter_tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn single_underruns_do_not_grow() {
-        let mut j = JitterReserve::new(6, 60);
+    fn single_underruns_do_not_grow_with_threshold() {
+        let mut j = JitterReserve::with_threshold(6, 4, 60, 3);
         let t = Instant::now();
         assert!(!j.underrun(t));
         assert!(!j.underrun(t + Duration::from_secs(10)));
@@ -174,7 +179,7 @@ mod jitter_tests {
 
     #[test]
     fn repeated_underruns_grow_up_to_max() {
-        let mut j = JitterReserve::new(6, 12);
+        let mut j = JitterReserve::with_threshold(6, 4, 12, 3);
         let t = Instant::now();
         j.underrun(t);
         j.underrun(t + Duration::from_millis(100));
@@ -188,5 +193,16 @@ mod jitter_tests {
             j.underrun(t + Duration::from_millis(400 + k));
         }
         assert_eq!(j.reserve_ms(), 12);
+    }
+
+    #[test]
+    fn default_grows_on_every_underrun() {
+        let mut j = JitterReserve::new(4, 3, 9);
+        let t = Instant::now();
+        assert!(j.underrun(t));
+        assert_eq!(j.reserve_ms(), 7);
+        assert!(j.underrun(t));
+        assert_eq!(j.reserve_ms(), 9);
+        assert!(!j.underrun(t));
     }
 }

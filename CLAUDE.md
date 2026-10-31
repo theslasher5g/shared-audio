@@ -50,9 +50,13 @@ Loopback ─▶ Capture-Thread ─▶ to_stereo ─▶ SPSC-Ring pro Ziel ─▶
   bei Event-Timeout (5 ms) werden Nullen nachgefüllt. Hält die Sink-Liste; Add/Remove/SetSource kommen per `mpsc`.
 - **Render-Thread** (1× je Ziel): eigene Reconnect-Schleife (Fehler → `Unavailable`, alle 1 s neu versuchen).
   Pro 2-ms-Chunk: Füllstand → Drift-Regler → Resampler → Delay → Gain-Rampe → Peak → WASAPI.
-  Niedrige Latenz: Gerätepuffer nur bis 1 Periode + 2 Chunks füllen; Ring-Soll = 1 Chunk + Jitter-Reserve
-  (`drift::JitterReserve`, Start 6 ms, +4 ms bei ≥ 3 Aussetzern in 5 s, max. 60 ms). Bei Unterlauf wird neu
-  gepuffert, bei > Soll + 25 ms werden die ältesten Samples verworfen. Audio-Threads laufen mit MMCSS „Pro Audio“.
+  Niedrige Latenz: Ring-Soll = Chunk + halbe Capture-Periode + Ring-Reserve (Start 4 ms); Gerätepuffer
+  = 1 Periode + Chunk + Geräte-Reserve (Start 4 ms). Beide Reserven (`drift::JitterReserve`) wachsen um 3 ms
+  je *echtem* Aussetzer: Ring-Unterläufe zählen nur, wenn danach weiter Loopback-Pakete kommen
+  (`SourceState::packets`), sonst ist die Quelle bloß verstummt. Über Soll + max(30 ms, 2 Perioden) wird verworfen.
+  `low_latency_stream` nutzt IAudioClient3 (kleinste Engine-Periode) für Ziele mit Stereo-f32-Mixformat und als
+  stillen Keepalive-Stream am Quellgerät (kleinere Loopback-Pakete). Audio-Threads laufen mit MMCSS „Pro Audio“.
+  Capture: Stille wird erst nachgefüllt, wenn ≥ max(4 Perioden, 40 ms) kein Paket kam – nie zwischen Paketen.
 - **Kein Lock/keine Allokation** in den Audio-Schleifen; Parameter und Pegel sind Atomics (`params.rs`).
   Pegel: `fetch_max` auf die f32-Bits (nicht-negative Floats sind monoton), GUI liest mit `swap(0)`.
 - **Rückkopplung:** `Engine::add_target`/`set_source` lehnen dasselbe Gerät ab; Render-Threads vergleichen

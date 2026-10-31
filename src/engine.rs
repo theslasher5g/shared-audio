@@ -31,16 +31,16 @@ use wasapi::{
 
 /// Größe des Ringpuffers pro Ziel.
 const RING_MS: usize = 500;
-/// Start-Sicherheitsreserve des Rings über einen Chunk hinaus (wächst bei wiederholten Aussetzern).
-const RESERVE_START_MS: u32 = 6;
-/// Obergrenze der Sicherheitsreserve.
-const RESERVE_MAX_MS: u32 = 60;
-/// Liegt der Füllstand so viel über dem Soll, werden die ältesten Samples verworfen.
-const DISCARD_EXCESS_MS: usize = 25;
+/// Jitter-Reserve des Rings über (Chunk + halbe Capture-Periode) hinaus: Start, Schritt, Maximum.
+const RING_RESERVE_MS: (u32, u32, u32) = (4, 3, 80);
+/// Reserve im Gerätepuffer über eine WASAPI-Periode hinaus: Start, Schritt, Maximum.
+const DEVICE_RESERVE_MS: (u32, u32, u32) = (4, 3, 40);
+/// Liegt der Füllstand so viel über dem Soll (mind. 2 Capture-Perioden), wird verworfen.
+const DISCARD_EXCESS_MS: usize = 30;
 /// Verarbeitungs-Chunk des Renderers (klein = geringe Latenz).
 const CHUNK_MS: u32 = 2;
-/// Zusätzliche Chunks im Gerätepuffer über eine WASAPI-Periode hinaus.
-const DEVICE_EXTRA_CHUNKS: usize = 2;
+/// Nach einem Ring-Unterlauf so lange warten, ob die Quelle nur verstummt ist.
+const UNDERRUN_VERIFY: Duration = Duration::from_millis(60);
 /// Wartezeit nach einem Fehler, bevor neu verbunden wird.
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 
@@ -51,6 +51,10 @@ pub struct SourceState {
     /// Hash der Geräte-ID der aktuell geöffneten Quelle, 0 = unbekannt.
     id_hash: AtomicU64,
     status: AtomicU32,
+    /// Capture-Periode der Quelle in Mikrosekunden (Paketabstand des Loopbacks).
+    period_us: AtomicU32,
+    /// Zähler echter Loopback-Pakete (zur Unterscheidung Aussetzer ↔ Quelle verstummt).
+    packets: AtomicU64,
     name: Mutex<String>,
 }
 
@@ -60,6 +64,8 @@ impl SourceState {
             rate: AtomicU32::new(0),
             id_hash: AtomicU64::new(0),
             status: AtomicU32::new(TargetStatus::Stopped as u32),
+            period_us: AtomicU32::new(10_000),
+            packets: AtomicU64::new(0),
             name: Mutex::new(String::new()),
         }
     }
@@ -345,14 +351,28 @@ fn capture_session(
     let is_f32 =
         matches!(mix.get_subformat(), Ok(SampleType::Float)) && mix.get_bitspersample() == 32;
     let fmt = if is_f32 {
-        mix
+        mix.clone()
     } else {
         WaveFormat::new(32, 32, &SampleType::Float, rate as usize, ch, None)
     };
-    let (period, _) = client.get_device_period()?;
+    // Kleinere Engine-Periode am Quellgerät erzwingen (falls der Treiber das kann): Ein stiller
+    // Low-Latency-Render-Stream hält das Gerät im kurzen Takt, der Loopback liefert dann kleinere
+    // Pakete in kürzeren Abständen.
+    let keepalive = low_latency_stream(&dev, &mix).and_then(|(c, frames)| {
+        c.start_stream().ok()?;
+        Some((c, frames))
+    });
+    let (default_period, _) = client.get_device_period()?;
+    let period = match &keepalive {
+        Some((_, frames)) => {
+            log::info!("Quelle: Low-Latency-Modus, Periode {frames} Frames");
+            *frames as i64 * 10_000_000 / rate as i64
+        }
+        None => default_period,
+    };
     let mode = StreamMode::EventsShared {
         autoconvert: true,
-        buffer_duration_hns: period,
+        buffer_duration_hns: default_period,
     };
     // Render-Gerät + Direction::Capture = Loopback.
     client.initialize_client(&fmt, &Direction::Capture, &mode)?;
@@ -368,10 +388,19 @@ fn capture_session(
     let silence = vec![0f32; (rate as usize / 5) * 2]; // max. 200 ms Stille am Stück
 
     log::info!("Quelle \"{name}\": {rate} Hz, {ch} Kanäle");
+    source
+        .period_us
+        .store((period / 10).clamp(1_000, 100_000) as u32, Relaxed);
     source.set_open(&dev_id, &name, rate);
     let _mmcss = mmcss::ProAudio::enter();
     client.start_stream()?;
 
+    // Loopback liefert bei Stille gar keine Pakete. Erst wenn länger als einige Perioden nichts
+    // kam, gilt die Quelle als still und es wird Stille im Echtzeittakt nachgefüllt – niemals
+    // zwischen zwei regulären Paketen (das würde hörbare Lücken in die Musik schneiden).
+    let period_dur = Duration::from_nanos(period as u64 * 100);
+    let idle_after = (period_dur * 4).max(Duration::from_millis(40));
+    let mut last_data = Instant::now();
     let mut last_emit = Instant::now();
     let mut last_default_check = Instant::now();
     let result = (|| -> Result<()> {
@@ -379,50 +408,55 @@ fn capture_session(
             if stop.load(Relaxed) || drain_cmds(rx, sinks, source_id) {
                 return Ok(());
             }
-            match event.wait_for_event(5) {
-                Ok(()) => {
-                    while let Some(n) = cap.get_next_packet_size()? {
-                        if n == 0 {
-                            break;
-                        }
-                        let (frames, info) = cap.read_from_device(&mut bytes)?;
-                        let frames = frames as usize;
-                        if frames == 0 {
-                            break;
-                        }
-                        let out = &mut stereo[..frames * 2];
-                        if info.flags.silent {
-                            out.fill(0.0);
-                        } else {
-                            let fl = &mut floats[..frames * ch];
-                            for (f, b) in fl.iter_mut().zip(bytes.chunks_exact(4)) {
-                                *f = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-                            }
-                            to_stereo(fl, ch, out);
-                        }
-                        broadcast(sinks, out);
-                        last_emit = Instant::now();
-                    }
+            // Event abwarten; bei Timeout trotzdem Pakete abholen (manche Treiber signalisieren im
+            // Loopback-Modus unzuverlässig). Fehler hier = Gerät getrennt.
+            let _ = event.wait_for_event(period_dur.as_millis().max(1) as u32 + 5);
+            let mut got_data = false;
+            while let Some(n) = cap.get_next_packet_size()? {
+                if n == 0 {
+                    break;
                 }
-                Err(_) => {
-                    // Loopback liefert bei Stille keine Pakete → Stille nachfüllen, damit die
-                    // Ziele nicht leerlaufen. Der Aufruf prüft zugleich, ob das Gerät noch lebt.
-                    let _ = cap.get_next_packet_size()?;
-                    let missing = (last_emit.elapsed().as_secs_f64() * rate as f64) as usize;
-                    let n = missing.min(silence.len() / 2);
-                    if n > 0 {
-                        broadcast(sinks, &silence[..n * 2]);
-                        last_emit += Duration::from_secs_f64(n as f64 / rate as f64);
-                        if last_emit.elapsed() > Duration::from_millis(200) {
-                            last_emit = Instant::now();
-                        }
+                let (frames, info) = cap.read_from_device(&mut bytes)?;
+                let frames = frames as usize;
+                if frames == 0 {
+                    break;
+                }
+                let out = &mut stereo[..frames * 2];
+                if info.flags.silent {
+                    out.fill(0.0);
+                } else {
+                    let fl = &mut floats[..frames * ch];
+                    for (f, b) in fl.iter_mut().zip(bytes.chunks_exact(4)) {
+                        *f = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                    }
+                    to_stereo(fl, ch, out);
+                }
+                broadcast(sinks, out);
+                got_data = true;
+            }
+            let now = Instant::now();
+            if got_data {
+                last_data = now;
+                last_emit = now;
+                source.packets.fetch_add(1, Relaxed);
+            } else if now.duration_since(last_data) >= idle_after {
+                let missing = (now.duration_since(last_emit).as_secs_f64() * rate as f64) as usize;
+                let n = missing.min(silence.len() / 2);
+                if n > 0 {
+                    broadcast(sinks, &silence[..n * 2]);
+                    last_emit += Duration::from_secs_f64(n as f64 / rate as f64);
+                    if now.duration_since(last_emit) > Duration::from_millis(200) {
+                        last_emit = now;
                     }
                 }
             }
             // Folgt die Quelle der Windows-Standardausgabe, auf Wechsel achten.
             if source_id.is_none() && last_default_check.elapsed() > Duration::from_secs(2) {
                 last_default_check = Instant::now();
-                if let Ok(cur) = devices::default_render_id() {
+                if let Ok(cur) = en
+                    .get_default_device_for_role(&Direction::Render, &Role::Console)
+                    .and_then(|d| d.get_id())
+                {
                     if cur != dev_id {
                         log::info!("Standardausgabe gewechselt – Quelle wird neu geöffnet");
                         return Ok(());
@@ -432,6 +466,9 @@ fn capture_session(
         }
     })();
     let _ = client.stop_stream();
+    if let Some((k, _)) = &keepalive {
+        let _ = k.stop_stream();
+    }
     source.set_closed(TargetStatus::Connecting);
     result
 }
@@ -495,29 +532,52 @@ fn render_session(ctx: &RenderCtx) -> Result<End> {
     if dev.get_state()? != DeviceState::Active {
         bail!("Gerät ist nicht aktiv");
     }
-    let mut client = dev.get_iaudioclient()?;
-    let dst_rate = client.get_mixformat()?.get_samplespersec();
-    // Stereo-Float in der Mix-Samplerate; Kanalzahl/Format passt Windows per autoconvert an.
-    let fmt = WaveFormat::new(32, 32, &SampleType::Float, dst_rate as usize, 2, None);
-    let (period, _) = client.get_device_period()?;
-    client.initialize_client(
-        &fmt,
-        &Direction::Render,
-        &StreamMode::EventsShared {
-            autoconvert: true,
-            buffer_duration_hns: 2 * period,
-        },
-    )?;
+    let probe = dev.get_iaudioclient()?;
+    let mix = probe.get_mixformat()?;
+    let dst_rate = mix.get_samplespersec();
+    // Bevorzugt: Low-Latency-Stream (IAudioClient3, kleinste Engine-Periode). Geht nur, wenn das
+    // Mix-Format bereits Stereo-f32 ist (dort gibt es kein autoconvert).
+    let low = if is_stereo_f32(&mix) {
+        low_latency_stream(&dev, &mix)
+    } else {
+        None
+    };
+    let (client, period) = match low {
+        Some((c, frames)) => {
+            log::info!(
+                "Ziel \"{}\": Low-Latency-Modus, Periode {frames} Frames",
+                ctx.name
+            );
+            (c, frames as i64 * 10_000_000 / dst_rate as i64)
+        }
+        None => {
+            let mut client = probe;
+            // Stereo-Float in der Mix-Samplerate; Kanalzahl/Format passt Windows per autoconvert an.
+            let fmt = WaveFormat::new(32, 32, &SampleType::Float, dst_rate as usize, 2, None);
+            let (period, _) = client.get_device_period()?;
+            client.initialize_client(
+                &fmt,
+                &Direction::Render,
+                &StreamMode::EventsShared {
+                    autoconvert: true,
+                    buffer_duration_hns: 2 * period,
+                },
+            )?;
+            (client, period)
+        }
+    };
     let event = client.set_get_eventhandle()?;
     let render = client.get_audiorenderclient()?;
 
     let chunk = (dst_rate * CHUNK_MS / 1000) as usize;
     let period_frames = (period as u64 * dst_rate as u64 / 10_000_000) as usize;
     let buffer_frames = client.get_buffer_size()? as usize;
-    // Gerätepuffer nur so weit füllen wie nötig: eine Engine-Periode plus kleine Reserve.
-    let max_padding = (period_frames + DEVICE_EXTRA_CHUNKS * chunk).min(buffer_frames);
     let mut resampler = StereoResampler::new(src_rate, dst_rate, chunk)?;
     let src_chunk = (src_rate * CHUNK_MS / 1000) as usize;
+    // Der Loopback liefert Pakete im Abstand einer Capture-Periode; im Mittel liegt also eine halbe
+    // Periode zusätzlich im Ring. Das Soll muss das abdecken, sonst läuft der Ring vor jedem Paket leer.
+    let src_period_frames =
+        (ctx.source.period_us.load(Relaxed) as u64 * src_rate as u64 / 1_000_000) as usize;
     let mut st = RenderState {
         in_buf: vec![0f32; resampler.input_frames_max() * 2 + 64],
         out_buf: vec![0f32; chunk * 2],
@@ -525,20 +585,32 @@ fn render_session(ctx: &RenderCtx) -> Result<End> {
         delay: DelayLine::for_rate(dst_rate),
         gain: GainRamp::new(ctx.params.effective_gain()),
         drift: DriftController::new(src_chunk, src_rate),
-        jitter: JitterReserve::new(RESERVE_START_MS, RESERVE_MAX_MS),
+        ring_reserve: JitterReserve::new(RING_RESERVE_MS.0, RING_RESERVE_MS.1, RING_RESERVE_MS.2),
+        dev_reserve: JitterReserve::new(
+            DEVICE_RESERVE_MS.0,
+            DEVICE_RESERVE_MS.1,
+            DEVICE_RESERVE_MS.2,
+        ),
         target_fill: 0,
-        src_chunk,
+        discard_at: 0,
+        base_fill: src_chunk + src_period_frames / 2,
+        src_period_frames,
+        max_padding: 0,
+        period_frames,
+        buffer_frames,
         chunk,
-        max_padding,
         period_ms: ((period / 10_000) as u32).max(1),
         dst_rate,
         src_rate,
+        pending_underrun: None,
     };
-    st.update_target();
+    st.update_targets();
 
     // Ring registrieren (nach Aufbau aller Puffer), Gerät mit minimaler Stille vorfüllen.
     let (prod, mut cons) = stereo_ring(src_rate as usize * RING_MS / 1000);
-    let prime = max_padding.min(client.get_available_space_in_frames()? as usize);
+    let prime = st
+        .max_padding
+        .min(client.get_available_space_in_frames()? as usize);
     render.write_to_device(prime, &vec![0u8; prime * 8], Some(BufferFlags::new(2)))?;
     let _ = ctx.cmd_tx.send(Cmd::AddSink(Sink {
         id: ctx.id,
@@ -549,10 +621,10 @@ fn render_session(ctx: &RenderCtx) -> Result<End> {
     client.start_stream()?;
     ctx.params.set_status(TargetStatus::Active);
     log::info!(
-        "Ziel \"{}\": {dst_rate} Hz (Quelle {src_rate} Hz), Periode {:.1} ms, Gerätepuffer max. {:.1} ms",
+        "Ziel \"{}\": {dst_rate} Hz (Quelle {src_rate} Hz), Periode {:.1} ms, Latenz ≈ {} ms",
         ctx.name,
         period as f64 / 10_000.0,
-        max_padding as f64 * 1000.0 / dst_rate as f64
+        st.latency_ms()
     );
 
     let result = render_loop(
@@ -577,22 +649,36 @@ struct RenderState {
     delay: DelayLine,
     gain: GainRamp,
     drift: DriftController,
-    jitter: JitterReserve,
-    /// Soll-Füllstand des Rings in Quell-Frames (Chunk + Reserve).
+    ring_reserve: JitterReserve,
+    dev_reserve: JitterReserve,
+    /// Soll-Füllstand des Rings in Quell-Frames.
     target_fill: usize,
-    src_chunk: usize,
-    chunk: usize,
+    discard_at: usize,
+    /// Chunk + halbe Capture-Periode (Quell-Frames).
+    base_fill: usize,
+    src_period_frames: usize,
+    /// Maximale Füllung des Gerätepuffers (Ziel-Frames).
     max_padding: usize,
+    period_frames: usize,
+    buffer_frames: usize,
+    chunk: usize,
     period_ms: u32,
     dst_rate: u32,
     src_rate: u32,
+    /// Ring-Unterlauf, der noch geprüft wird: (Zeitpunkt, Paketzähler der Quelle).
+    pending_underrun: Option<(Instant, u64)>,
 }
 
 impl RenderState {
-    fn update_target(&mut self) {
-        let reserve = self.src_rate as usize * self.jitter.reserve_ms() as usize / 1000;
-        self.target_fill = self.src_chunk + reserve;
+    fn update_targets(&mut self) {
+        let rate = self.src_rate as usize;
+        let reserve = rate * self.ring_reserve.reserve_ms() as usize / 1000;
+        self.target_fill = self.base_fill + reserve;
+        let excess = (rate * DISCARD_EXCESS_MS / 1000).max(2 * self.src_period_frames);
+        self.discard_at = self.target_fill + excess;
         self.drift.set_target(self.target_fill);
+        let dev_extra = self.dst_rate as usize * self.dev_reserve.reserve_ms() as usize / 1000;
+        self.max_padding = (self.period_frames + self.chunk + dev_extra).min(self.buffer_frames);
     }
 
     /// Geschätzte Latenz der Kette in ms (Ring + Gerätepuffer, ohne einstellbares Delay).
@@ -600,17 +686,6 @@ impl RenderState {
         let ring = self.target_fill as f64 * 1000.0 / self.src_rate as f64;
         let dev = self.max_padding as f64 * 1000.0 / self.dst_rate as f64;
         (ring + dev).round() as u32
-    }
-
-    fn underrun(&mut self, params: &TargetParams) {
-        params.underruns.fetch_add(1, Relaxed);
-        if self.jitter.underrun(Instant::now()) {
-            self.update_target();
-            log::info!(
-                "Aussetzer gehäuft – Puffer auf {} ms erhöht",
-                self.jitter.reserve_ms()
-            );
-        }
     }
 }
 
@@ -626,7 +701,6 @@ fn render_loop(
     let dev_hash = id_hash(&ctx.device_id);
     let params = &ctx.params;
     let mut started = false;
-    let src_rate = st.src_rate as usize;
     loop {
         if ctx.stop.load(Relaxed) {
             return Ok(End::Stop);
@@ -640,10 +714,35 @@ fn render_loop(
         let target_gain = params.effective_gain();
         params.set_latency_ms(st.latency_ms());
 
+        // Ring-Unterlauf auswerten: kamen danach weiter Pakete, war es ein echter Aussetzer
+        // (Reserve erhöhen). Kam nichts mehr, ist die Quelle nur verstummt (nichts tun).
+        if let Some((t, pkts)) = st.pending_underrun {
+            if t.elapsed() >= UNDERRUN_VERIFY {
+                st.pending_underrun = None;
+                if ctx.source.packets.load(Relaxed) >= pkts + 2 {
+                    params.underruns.fetch_add(1, Relaxed);
+                    if st.ring_reserve.underrun(Instant::now()) {
+                        st.update_targets();
+                        log::info!(
+                            "Aussetzer – Ring-Reserve jetzt {} ms",
+                            st.ring_reserve.reserve_ms()
+                        );
+                    }
+                }
+            }
+        }
+
         let padding = client.get_current_padding()? as usize;
         if started && padding == 0 {
-            // Gerätepuffer ist leergelaufen (Thread zu spät geweckt).
-            st.underrun(params);
+            // Gerätepuffer leergelaufen, obwohl Daten da waren → Thread wurde zu spät geweckt.
+            params.underruns.fetch_add(1, Relaxed);
+            if st.dev_reserve.underrun(Instant::now()) {
+                st.update_targets();
+                log::info!(
+                    "Aussetzer – Geräte-Reserve jetzt {} ms",
+                    st.dev_reserve.reserve_ms()
+                );
+            }
         }
         let mut space = st.max_padding.saturating_sub(padding);
         while space >= st.chunk {
@@ -655,8 +754,7 @@ fn render_loop(
                 started = true;
                 st.drift.reset();
             }
-            let discard_at = st.target_fill + src_rate * DISCARD_EXCESS_MS / 1000;
-            if fill > discard_at {
+            if fill > st.discard_at {
                 // Puffer läuft über (z. B. nach Scheduling-Pause) → älteste Samples verwerfen.
                 let d = discard_frames(cons, fill - st.target_fill);
                 params.dropped_frames.fetch_add(d as u64, Relaxed);
@@ -666,7 +764,9 @@ fn render_loop(
             resampler.set_relative_ratio(st.drift.update(fill));
             let need = resampler.input_frames_next();
             if !pop_frames_exact(cons, &mut st.in_buf[..need * 2]) {
-                st.underrun(params);
+                if st.pending_underrun.is_none() {
+                    st.pending_underrun = Some((Instant::now(), ctx.source.packets.load(Relaxed)));
+                }
                 started = false; // neu puffern
                 break;
             }
@@ -682,11 +782,37 @@ fn render_loop(
             space -= st.chunk;
         }
 
-        // Kurz warten: das Event kommt einmal pro Periode; ohne Daten im Ring nach 1 ms erneut prüfen.
+        // Das Event kommt einmal pro Periode. Solange gepuffert wird, öfter nachsehen.
         let timeout = if started { st.period_ms * 2 } else { 1 };
         if event.wait_for_event(timeout).is_err() {
             // Timeout: prüft zugleich, ob das Gerät noch lebt (Fehler bei Trennung).
             client.get_current_padding()?;
+        }
+    }
+}
+
+fn is_stereo_f32(fmt: &WaveFormat) -> bool {
+    fmt.get_nchannels() == 2
+        && fmt.get_bitspersample() == 32
+        && matches!(fmt.get_subformat(), Ok(SampleType::Float))
+}
+
+/// Öffnet einen Shared-Mode-Render-Stream mit der kleinsten vom Treiber unterstützten
+/// Engine-Periode (IAudioClient3). `None`, wenn nicht unterstützt oder nicht kleiner als Standard.
+fn low_latency_stream(
+    dev: &wasapi::Device,
+    mix: &WaveFormat,
+) -> Option<(wasapi::AudioClient, u32)> {
+    let mut c = dev.get_iaudioclient().ok()?;
+    let p = c.get_shared_mode_engine_period(mix).ok()?;
+    if p.min == 0 || p.min >= p.default {
+        return None;
+    }
+    match c.initialize_shared_audio_stream(mix, wasapi::TimingMode::Events, p.min) {
+        Ok(()) => Some((c, p.min)),
+        Err(e) => {
+            log::debug!("Low-Latency-Modus nicht möglich: {e}");
+            None
         }
     }
 }
