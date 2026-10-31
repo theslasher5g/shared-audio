@@ -47,7 +47,7 @@ Loopback ─▶ Capture-Thread ─▶ to_stereo ─▶ SPSC-Ring pro Ziel ─▶
 
 - **Capture-Thread** (1×): öffnet die Quelle (`None` = Windows-Standard, folgt Wechseln der Standardausgabe),
   liest das Mix-Format, mischt auf Stereo, schreibt in alle Sinks. Bei Stille liefert Loopback keine Pakete →
-  bei Event-Timeout (20 ms) werden Nullen nachgefüllt. Hält die Sink-Liste; Add/Remove/SetSource kommen per `mpsc`.
+  bei Event-Timeout (5 ms) werden Nullen nachgefüllt. Hält die Sink-Liste; Add/Remove/SetSource kommen per `mpsc`.
 - **Render-Thread** (1× je Ziel): eigene Reconnect-Schleife (Fehler → `Unavailable`, alle 1 s neu versuchen).
   Pro 2-ms-Chunk: Füllstand → Drift-Regler → Resampler → Delay → Gain-Rampe → Peak → WASAPI.
   Niedrige Latenz: Gerätepuffer nur bis 1 Periode + 2 Chunks füllen; Ring-Soll = 1 Chunk + Jitter-Reserve
