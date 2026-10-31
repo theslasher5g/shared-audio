@@ -3,6 +3,8 @@
 //! Plattformunabhängiger Kern (Delay, Kanäle, Resampling, Drift, Ring, Config, Parameter)
 //! plus der Windows-spezifische Teil (WASAPI, Engine, GUI).
 
+#![allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
+
 pub mod channels;
 pub mod config;
 pub mod delay;
